@@ -1,0 +1,161 @@
+name: pointcite
+services:
+  app-migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pointcite:local
+    restart: "no"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://pointcite:pointcite@postgres:5432/pointcite?schema=public
+      REDIS_URL: redis://redis:6379
+      BETTER_AUTH_URL: http://localhost:3000
+      STORAGE_DIR: /app/storage
+    command: ["pnpm", "db:setup"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - sl_storage:/app/storage
+      - sl_samples:/app/sample-uploads
+
+  app:
+    image: pointcite:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://pointcite:pointcite@postgres:5432/pointcite?schema=public
+      REDIS_URL: redis://redis:6379
+      BETTER_AUTH_URL: http://localhost:3000
+      STORAGE_DIR: /app/storage
+    ports:
+      - "3000:3000"
+    depends_on:
+      app-migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - sl_storage:/app/storage
+      - sl_samples:/app/sample-uploads
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  worker:
+    image: pointcite:local
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://pointcite:pointcite@postgres:5432/pointcite?schema=public
+      REDIS_URL: redis://redis:6379
+      BETTER_AUTH_URL: http://localhost:3000
+      STORAGE_DIR: /app/storage
+    command: ["pnpm", "worker"]
+    depends_on:
+      app-migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - sl_storage:/app/storage
+      - sl_samples:/app/sample-uploads
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: pointcite
+      POSTGRES_PASSWORD: pointcite
+      POSTGRES_DB: pointcite
+    ports:
+      - "5432:5432"
+    volumes:
+      - sl_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pointcite"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - sl_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["ollama"]
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - sl_ollama:/root/.ollama
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.63.0
+    profiles: ["observability"]
+    restart: unless-stopped
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+
+  minio:
+    image: minio/minio:latest
+    profiles: ["s3"]
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: pointcite
+      MINIO_ROOT_PASSWORD: pointcite-secret
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - sl_minio:/data
+
+  minio-create-bucket:
+    image: minio/mc:latest
+    profiles: ["s3"]
+    depends_on:
+      - minio
+    entrypoint:
+      [
+        "sh",
+        "-c",
+        "until mc alias set local http://minio:9000 pointcite pointcite-secret; do sleep 1; done; mc mb --ignore-existing local/pointcite",
+      ]
+
+volumes:
+  sl_pg:
+  sl_redis:
+  sl_ollama:
+  sl_minio:
+  sl_storage:
+  sl_samples:
